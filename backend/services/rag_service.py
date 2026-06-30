@@ -9,7 +9,15 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from core.ai import LLMProvider, get_llm_provider, get_vector_store
 from core.config import get_settings
-from services.chat_service import document_title_from_name, get_retrieval_collection
+from services.ai_service import rewrite_question
+from services.chat_service import get_retrieval_collection
+from services.memory_service import (
+    build_session_context,
+    build_system_prompt,
+    conversation_for_llm,
+    format_conversation_for_rewrite,
+    needs_query_rewrite,
+)
 from utils.llm_output import ThinkingStreamFilter, strip_thinking_blocks
 from utils.response import sse_event
 
@@ -17,21 +25,6 @@ logger = logging.getLogger(__name__)
 
 STREAM_ERROR_MESSAGE = "Sorry, I couldn't generate a response. Please try again."
 
-SYSTEM_PROMPT_TEMPLATE = """You are a professional financial analyst assisting with document intelligence.
-
-Document: {document_title}
-
-INSTRUCTIONS:
-1. Answer ONLY using information from the Context below — never invent financial figures or facts.
-2. If the answer is not in the Context, clearly state: "This information is not stated in the document."
-3. Cite page numbers when available (e.g., "Page 12").
-4. Distinguish documented facts from your interpretation.
-5. Use clear, professional language appropriate for financial analysis.
-6. Structure responses with direct answers followed by supporting detail when helpful.
-7. Respond directly to the user. Never include internal reasoning, thinking tags, or chain-of-thought in your reply.
-
-Context:
-{context}"""
 
 def _format_chunk_metadata(metadata: dict[str, Any]) -> str:
     parts: list[str] = []
@@ -84,12 +77,6 @@ def build_sources(docs: list[Any]) -> list[dict[str, Any]]:
     return sources
 
 
-def _document_title(chat: dict[str, Any]) -> str:
-    if chat.get("documentName"):
-        return document_title_from_name(chat["documentName"])
-    return chat.get("title") or "Financial Document"
-
-
 async def _client_disconnected(request: Request | None) -> bool:
     return request is not None and await request.is_disconnected()
 
@@ -109,19 +96,40 @@ async def _persist_messages(
     )
 
 
-def _conversation_for_llm(
-    messages: list[dict[str, Any]],
+async def _resolve_retrieval_query(
     *,
-    limit: int,
-) -> list[dict[str, str]]:
-    recent = messages[-limit:]
-    llm_messages: list[dict[str, str]] = []
-    for item in recent:
-        role = item.get("role")
-        content = item.get("content", "")
-        if role in ("user", "assistant") and content:
-            llm_messages.append({"role": role, "content": content})
-    return llm_messages
+    message: str,
+    chat: dict[str, Any],
+    prior_messages: list[dict[str, Any]],
+    settings,
+) -> str:
+    """Rewrite follow-up questions for retrieval only; original message stays in history."""
+    if not needs_query_rewrite(
+        message,
+        prior_messages,
+        min_words=settings.REWRITE_MIN_WORDS,
+    ):
+        return message
+
+    session_context = build_session_context(chat)
+    history_messages = conversation_for_llm(
+        prior_messages,
+        max_turns=settings.CHAT_MEMORY_TURNS,
+    )
+    history_text = format_conversation_for_rewrite(history_messages)
+
+    try:
+        rewritten = await rewrite_question(
+            message,
+            session_context=session_context,
+            history=history_text,
+        )
+        if rewritten and rewritten != message:
+            logger.info("Query rewritten for retrieval: %r -> %r", message, rewritten)
+        return rewritten or message
+    except Exception:
+        logger.exception("Query rewrite failed; using original message for retrieval")
+        return message
 
 
 async def stream_chat_response(
@@ -139,13 +147,20 @@ async def stream_chat_response(
 
     title = chat.get("title", "New Chat")
     messages = list(chat.get("messages", []))
+    prior_messages = list(messages)
 
     if not messages or title == "New Chat":
         max_len = settings.CHAT_TITLE_MAX_LENGTH
         title = message if len(message) <= max_len else f"{message[:max_len]}..."
 
     now = datetime.now(timezone.utc)
-    messages.append({"role": "user", "content": message})
+    messages.append(
+        {
+            "role": "user",
+            "content": message,
+            "timestamp": now.isoformat(),
+        }
+    )
     await _persist_messages(
         chats,
         chat_id=chat_id,
@@ -161,7 +176,13 @@ async def stream_chat_response(
     collection_name = get_retrieval_collection(chat, settings)
     if not collection_name:
         fallback = "Please upload a PDF document to this chat before asking questions."
-        messages.append({"role": "assistant", "content": fallback})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": fallback,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         await _persist_messages(
             chats,
             chat_id=chat_id,
@@ -181,12 +202,25 @@ async def stream_chat_response(
         collection_name,
     )
 
+    retrieval_query = await _resolve_retrieval_query(
+        message=message,
+        chat=chat,
+        prior_messages=prior_messages,
+        settings=settings,
+    )
+
     try:
-        docs = await retrieve_documents(message, collection_name)
+        docs = await retrieve_documents(retrieval_query, collection_name)
     except Exception:
         logger.exception("Document retrieval failed for chat %s", chat_id)
         fallback = STREAM_ERROR_MESSAGE
-        messages.append({"role": "assistant", "content": fallback})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": fallback,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         await _persist_messages(
             chats,
             chat_id=chat_id,
@@ -201,7 +235,13 @@ async def stream_chat_response(
 
     if not docs:
         fallback = "This information is not stated in the document."
-        messages.append({"role": "assistant", "content": fallback})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": fallback,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         await _persist_messages(
             chats,
             chat_id=chat_id,
@@ -219,19 +259,19 @@ async def stream_chat_response(
 
     context = build_context(docs)
     sources = build_sources(docs)
-    document_title = _document_title(chat)
+    session_context = build_session_context(chat)
     llm: LLMProvider = get_llm_provider()
 
-    prior_turns = _conversation_for_llm(
-        messages[:-1],
-        limit=settings.CHAT_HISTORY_LIMIT,
+    prior_turns = conversation_for_llm(
+        prior_messages,
+        max_turns=settings.CHAT_MEMORY_TURNS,
     )
     stream_messages: list[dict[str, str]] = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT_TEMPLATE.format(
-                document_title=document_title,
-                context=context,
+            "content": build_system_prompt(
+                session_context=session_context,
+                document_context=context,
             ),
         },
         *prior_turns,
@@ -268,15 +308,14 @@ async def stream_chat_response(
 
     full_answer = strip_thinking_blocks(full_answer)
 
-    if not full_answer.strip() and not stream_failed:
-        full_answer = STREAM_ERROR_MESSAGE
-        yield sse_event({"error": STREAM_ERROR_MESSAGE})
-
-    if stream_failed and not full_answer:
+    if not full_answer.strip():
         full_answer = STREAM_ERROR_MESSAGE
         yield sse_event({"error": STREAM_ERROR_MESSAGE})
     elif stream_failed:
-        yield sse_event({"error": STREAM_ERROR_MESSAGE})
+        logger.warning(
+            "Chat stream ended with errors but a usable answer was recovered for chat %s",
+            chat_id,
+        )
 
     if full_answer:
         assistant_message = {
@@ -298,4 +337,11 @@ async def stream_chat_response(
     if disconnected:
         return
 
-    yield sse_event({"sources": sources, "title": title, "done": True})
+    yield sse_event(
+        {
+            "sources": sources,
+            "title": title,
+            "content": full_answer if full_answer != STREAM_ERROR_MESSAGE else "",
+            "done": True,
+        }
+    )

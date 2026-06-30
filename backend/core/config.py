@@ -22,13 +22,17 @@ class Settings(BaseSettings):
     QDRANT_COLLECTION: str = "axiom-documents"
     QDRANT_COLLECTION_PREFIX: str = "axiom_"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
-    CHAT_MODEL: str = "deepseek-ai/DeepSeek-R1:novita"
+    CHAT_MODEL: str = "meta-llama/Llama-3.1-8B-Instruct:fastest"
+    REWRITE_MODEL: str = "meta-llama/Llama-3.1-8B-Instruct:fastest"
     RETRIEVAL_K: int = 5
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 150
     UPLOAD_DIR: str = "uploads"
     MAX_UPLOAD_BYTES: int = 200 * 1024 * 1024
 
+    REWRITE_MIN_WORDS: int = 6
+    REWRITE_MAX_TOKENS: int = 80
+    CHAT_MEMORY_TURNS: int = 8
     CHAT_HISTORY_LIMIT: int = 8
     CHAT_TITLE_MAX_LENGTH: int = 50
     CHAT_MAX_TOKENS: int = 500
@@ -39,7 +43,7 @@ class Settings(BaseSettings):
     HF_EMBEDDING_RETRY_ATTEMPTS: int = 5
     HF_CHAT_TIMEOUT: float = 120.0
     ANALYSIS_MAX_TOKENS: int = 2000
-    ANALYSIS_MODEL: str = ""
+    ANALYSIS_MODEL: str = "meta-llama/Llama-3.1-8B-Instruct:fastest"
 
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_STORAGE: str = "redis"

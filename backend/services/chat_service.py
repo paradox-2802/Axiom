@@ -20,6 +20,8 @@ DEFAULT_DOCUMENT_FIELDS: dict[str, Any] = {
     "vectorCollection": None,
     "pdfPath": None,
     "lastOpenedAt": None,
+    "companyName": None,
+    "reportingPeriod": None,
     "executiveSummary": None,
     "riskAnalysis": None,
     "summaryStatus": "pending",
@@ -61,6 +63,35 @@ def document_title_from_name(filename: str) -> str:
     return name.strip() or "New Chat"
 
 
+def normalize_messages(messages: Any) -> list[dict[str, Any]]:
+    """Return chronological user/assistant messages for API responses."""
+    if not isinstance(messages, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role not in ("user", "assistant"):
+            continue
+
+        content = item.get("content", "")
+        if not isinstance(content, str):
+            content = str(content) if content is not None else ""
+
+        msg: dict[str, Any] = {"role": role, "content": content}
+        if item.get("timestamp"):
+            msg["timestamp"] = item["timestamp"]
+        if item.get("insightType"):
+            msg["insightType"] = item["insightType"]
+        if role == "assistant" and item.get("sources"):
+            msg["sources"] = item["sources"]
+        normalized.append(msg)
+
+    return normalized
+
+
 def serialize_document_fields(chat: dict[str, Any]) -> dict[str, Any]:
     return {
         "documentName": chat.get("documentName"),
@@ -69,6 +100,8 @@ def serialize_document_fields(chat: dict[str, Any]) -> dict[str, Any]:
         "ingestionStatus": chat.get("ingestionStatus", "pending"),
         "uploadedAt": chat.get("uploadedAt"),
         "vectorCollection": chat.get("vectorCollection"),
+        "companyName": chat.get("companyName"),
+        "reportingPeriod": chat.get("reportingPeriod"),
         "executiveSummary": chat.get("executiveSummary"),
         "riskAnalysis": chat.get("riskAnalysis"),
         "summaryStatus": chat.get("summaryStatus", "pending"),

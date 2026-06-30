@@ -16,6 +16,41 @@ import { getStoredTheme, toggleTheme } from "../utils/theme";
 import { formatRisksMarkdown, formatSummaryMarkdown } from "../utils/formatInsights";
 import { stripThinkingBlocks } from "../utils/stripThinking";
 
+const INSIGHT_PROMPTS = {
+  summary: "Generate Executive Summary",
+  risks: "Extract Risks",
+};
+
+function mergeInsightMessages(messages = [], history = {}) {
+  const merged = [...messages];
+  const hasSummary = merged.some((m) => m.insightType === "summary");
+  const hasRisks = merged.some((m) => m.insightType === "risks");
+
+  if (history.executiveSummary && !hasSummary) {
+    merged.push(
+      { role: "user", content: INSIGHT_PROMPTS.summary },
+      {
+        role: "assistant",
+        content: formatSummaryMarkdown(history.executiveSummary),
+        insightType: "summary",
+      }
+    );
+  }
+
+  if (history.riskAnalysis && !hasRisks) {
+    merged.push(
+      { role: "user", content: INSIGHT_PROMPTS.risks },
+      {
+        role: "assistant",
+        content: formatRisksMarkdown(history.riskAnalysis),
+        insightType: "risks",
+      }
+    );
+  }
+
+  return merged;
+}
+
 function sanitizeMessages(messages = []) {
   return messages.map((m) =>
     m.role === "assistant" && m.content
@@ -49,10 +84,34 @@ function getSessionState(meta, messageCount) {
 const WELCOME_MESSAGE =
   "Your document is ready. Ask me anything about this financial report.";
 
-const INSIGHT_PROMPTS = {
-  summary: "Generate Executive Summary",
-  risks: "Extract Risks",
-};
+function buildMessagesFromHistory(history) {
+  if (!history) return [];
+
+  const messageCount = history.messages?.length || 0;
+  const state = getSessionState(
+    {
+      documentUploaded: history.documentUploaded,
+      ingestionStatus: history.ingestionStatus,
+    },
+    messageCount
+  );
+
+  if (messageCount > 0) {
+    return sanitizeMessages(mergeInsightMessages(history.messages, history));
+  }
+  if (state === "ready") {
+    return [{ role: "assistant", content: WELCOME_MESSAGE }];
+  }
+  return sanitizeMessages(mergeInsightMessages([], history));
+}
+
+function shouldKeepLocalMessages(localMessages, serverMessages) {
+  if (!localMessages?.length) return false;
+  if (localMessages.some((m) => m.isStreaming)) return true;
+
+  const localPersisted = localMessages.filter((m) => !m.isStreaming);
+  return localPersisted.length > serverMessages.length;
+}
 
 const markdownComponents = {
   p: (props) => <p {...props} />,
@@ -166,35 +225,38 @@ export default function Chatbot() {
   useEffect(() => {
     if (!currentChatId) return;
 
-    authFetch(`/chat/history/${currentChatId}`)
+    const chatId = currentChatId;
+    let cancelled = false;
+
+    authFetch(`/chat/history/${chatId}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (!d) return;
+        if (cancelled || !d) return;
+
         setSessionMeta((p) => ({
           ...p,
-          [currentChatId]: {
+          [chatId]: {
             documentName: d.documentName,
             documentUploaded: d.documentUploaded,
             documentLocked: d.documentLocked,
             ingestionStatus: d.ingestionStatus || "pending",
           },
         }));
-        const messageCount = d.messages?.length || 0;
-        const state = getSessionState(
-          { documentUploaded: d.documentUploaded, ingestionStatus: d.ingestionStatus },
-          messageCount
-        );
-        setChats((p) => ({
-          ...p,
-          [currentChatId]:
-            messageCount > 0
-              ? sanitizeMessages(d.messages)
-              : state === "ready"
-                ? [{ role: "assistant", content: WELCOME_MESSAGE }]
-                : [],
-        }));
+
+        const serverMessages = buildMessagesFromHistory(d);
+        setChats((p) => {
+          const local = p[chatId] || [];
+          if (shouldKeepLocalMessages(local, serverMessages)) {
+            return p;
+          }
+          return { ...p, [chatId]: serverMessages };
+        });
       })
       .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
   }, [currentChatId]);
 
   useEffect(() => {
@@ -325,12 +387,15 @@ export default function Chatbot() {
 
       await consumeChatStream(res, (data) => {
         if (data.error) {
-          streamContentRef.current = data.error;
-          updateLastAssistantMessage(chatId, (m) => ({
-            ...m,
-            content: data.error,
-            isStreaming: false,
-          }));
+          const existing = stripThinkingBlocks(streamContentRef.current || "");
+          if (!existing) {
+            streamContentRef.current = data.error;
+            updateLastAssistantMessage(chatId, (m) => ({
+              ...m,
+              content: data.error,
+              isStreaming: false,
+            }));
+          }
         }
         if (data.content) {
           streamContentRef.current += data.content;
@@ -342,11 +407,12 @@ export default function Chatbot() {
         if (data.sources) sources = data.sources;
         if (data.title) title = data.title;
         if (data.done) {
-          const cleaned = stripThinkingBlocks(streamContentRef.current || "");
-          streamContentRef.current = cleaned;
+          const streamed = stripThinkingBlocks(streamContentRef.current || "");
+          const finalContent = stripThinkingBlocks(data.content || streamed || "");
+          streamContentRef.current = finalContent;
           updateLastAssistantMessage(chatId, (m) => ({
             ...m,
-            content: cleaned || m.content,
+            content: finalContent || m.content,
             sources,
             isStreaming: false,
           }));
@@ -401,7 +467,7 @@ export default function Chatbot() {
       const formatFn = type === "summary" ? formatSummaryMarkdown : formatRisksMarkdown;
 
       let result = await fetchFn(chatId);
-      if (result.status === "idle" || result.status === "failed") {
+      if (result.status === "idle" || result.status === "error") {
         result = await generateFn(chatId);
       }
 

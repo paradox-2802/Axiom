@@ -100,3 +100,114 @@ async def test_legacy_chat_with_messages_can_post(client: AsyncClient):
             json={"chatId": "legacy-chat", "message": "Follow up question"},
         )
     assert response.status_code == 200
+
+
+async def test_chat_history_returns_full_conversation(client: AsyncClient):
+    import core.database as database
+
+    signup = await signup_user(client, email="history-user@example.com")
+    token = signup["token"]
+    chat_id = "history-chat"
+
+    await create_chat(client, token, chat_id=chat_id)
+    await database._db.chats.update_one(
+        {"chatId": chat_id},
+        {
+            "$set": {
+                "documentUploaded": True,
+                "ingestionStatus": "completed",
+                "vectorCollection": f"axiom_{chat_id}",
+                "messages": [
+                    {"role": "user", "content": "What is revenue?", "timestamp": "t1"},
+                    {
+                        "role": "assistant",
+                        "content": "Revenue was $10M.",
+                        "timestamp": "t2",
+                        "sources": [{"page": 3, "preview": "Revenue..."}],
+                    },
+                    {"role": "user", "content": "What about last year?", "timestamp": "t3"},
+                    {
+                        "role": "assistant",
+                        "content": "Last year revenue was $8M.",
+                        "timestamp": "t4",
+                    },
+                ],
+            }
+        },
+    )
+
+    response = await client.get(
+        f"/chat/history/{chat_id}",
+        headers=auth_headers(token),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["messages"]) == 4
+    assert body["messages"][0]["content"] == "What is revenue?"
+    assert body["messages"][1]["sources"][0]["page"] == 3
+    assert body["messages"][3]["content"] == "Last year revenue was $8M."
+
+    other_user = await signup_user(client, email="other-history-user@example.com")
+    denied = await client.get(
+        f"/chat/history/{chat_id}",
+        headers=auth_headers(other_user["token"]),
+    )
+    assert denied.status_code == 200
+    assert denied.json()["messages"] == []
+
+
+async def test_chat_history_returns_full_conversation(client: AsyncClient):
+    from bson import ObjectId
+
+    import core.database as database
+
+    signup = await signup_user(client, email="history-user@example.com")
+    token = signup["token"]
+    user_id = signup["user"]["id"]
+    chat_id = "history-chat"
+
+    await create_chat(client, token, chat_id=chat_id)
+    await database._db.chats.update_one(
+        {"chatId": chat_id},
+        {
+            "$set": {
+                "documentUploaded": True,
+                "ingestionStatus": "completed",
+                "vectorCollection": f"axiom_{chat_id}",
+                "messages": [
+                    {"role": "user", "content": "What is revenue?", "timestamp": "t1"},
+                    {
+                        "role": "assistant",
+                        "content": "Revenue was $10M.",
+                        "timestamp": "t2",
+                        "sources": [{"page": 3, "preview": "Revenue..."}],
+                    },
+                    {"role": "user", "content": "What about last year?", "timestamp": "t3"},
+                    {
+                        "role": "assistant",
+                        "content": "Last year revenue was $8M.",
+                        "timestamp": "t4",
+                    },
+                ],
+            }
+        },
+    )
+
+    response = await client.get(
+        f"/chat/history/{chat_id}",
+        headers=auth_headers(token),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["messages"]) == 4
+    assert body["messages"][0]["content"] == "What is revenue?"
+    assert body["messages"][1]["sources"][0]["page"] == 3
+    assert body["messages"][3]["content"] == "Last year revenue was $8M."
+
+    other_user = await signup_user(client, email="other-history-user@example.com")
+    denied = await client.get(
+        f"/chat/history/{chat_id}",
+        headers=auth_headers(other_user["token"]),
+    )
+    assert denied.status_code == 200
+    assert denied.json()["messages"] == []

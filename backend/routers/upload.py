@@ -75,6 +75,7 @@ async def upload_document(
                     "vectorCollection": vector_collection,
                     "pdfPath": path,
                     "title": title,
+                    "companyName": title,
                     "updatedAt": now,
                 }
             },
@@ -93,6 +94,8 @@ async def upload_document(
                     "uploadedAt": None,
                     "vectorCollection": None,
                     "pdfPath": None,
+                    "companyName": None,
+                    "reportingPeriod": None,
                     "updatedAt": now,
                 }
             },

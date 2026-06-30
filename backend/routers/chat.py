@@ -11,11 +11,13 @@ from core.database import get_db
 from core.rate_limit import limiter
 from middleware.auth import get_current_user_id
 from models.chat import ChatCreate, ChatMessageRequest
+from services.analysis_service import sync_insight_messages
 from services.chat_service import (
     can_send_messages,
     cleanup_chat_resources,
     document_title_from_name,
     new_chat_document_fields,
+    normalize_messages,
     serialize_document_fields,
 )
 from services.rag_service import stream_chat_response
@@ -32,6 +34,7 @@ def serialize_chat(doc: dict[str, Any] | None) -> dict[str, Any]:
         serialized["_id"] = str(serialized["_id"])
     if isinstance(serialized.get("userId"), ObjectId):
         serialized["userId"] = str(serialized["userId"])
+    serialized["messages"] = normalize_messages(doc.get("messages"))
     serialized.update(serialize_document_fields(doc))
     return serialized
 
@@ -144,6 +147,12 @@ async def get_chat_history(
         {"chatId": chat_id, "userId": ObjectId(user_id)}
     )
     if chat:
+        chat = await sync_insight_messages(
+            db,
+            user_id=user_id,
+            chat_id=chat_id,
+            chat=chat,
+        )
         await db["chats"].update_one(
             {"chatId": chat_id, "userId": ObjectId(user_id)},
             {"$set": {"lastOpenedAt": datetime.now(timezone.utc)}},

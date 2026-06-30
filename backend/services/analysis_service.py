@@ -13,6 +13,11 @@ from core.config import Settings, get_settings
 from models.insights import ExecutiveSummaryData, RiskAnalysisData
 from services.chat_service import get_retrieval_collection
 from services.rag_service import build_context, retrieve_documents
+from utils.format_insights import (
+    INSIGHT_USER_PROMPTS,
+    format_risks_markdown,
+    format_summary_markdown,
+)
 from utils.llm_output import strip_thinking_blocks
 
 logger = logging.getLogger(__name__)
@@ -74,7 +79,104 @@ def _extract_json(raw: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start == -1 or end == -1:
         raise ValueError("No JSON object found in model response")
-    return json.loads(text[start : end + 1])
+
+    candidate = text[start : end + 1]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+        return json.loads(cleaned)
+
+
+def _normalize_risk_payload(parsed: dict[str, Any]) -> dict[str, Any]:
+    risks = parsed.get("risks")
+    if not isinstance(risks, list):
+        return parsed
+
+    normalized: list[dict[str, Any]] = []
+    for item in risks:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity", "Medium")).strip().capitalize()
+        if severity not in {"High", "Medium", "Low"}:
+            severity = "Medium"
+        normalized.append(
+            {
+                "category": str(item.get("category", "Risk")).strip() or "Risk",
+                "description": str(item.get("description", "")).strip(),
+                "severity": severity,
+            }
+        )
+    return {**parsed, "risks": normalized}
+
+
+def _messages_with_insight(
+    messages: list[dict[str, Any]],
+    *,
+    insight_type: str,
+    user_prompt: str,
+    assistant_content: str,
+    timestamp: datetime,
+) -> list[dict[str, Any]]:
+    kept = [m for m in messages if m.get("insightType") != insight_type]
+    ts = timestamp.isoformat()
+    kept.append({"role": "user", "content": user_prompt, "timestamp": ts})
+    kept.append(
+        {
+            "role": "assistant",
+            "content": assistant_content,
+            "timestamp": ts,
+            "insightType": insight_type,
+        }
+    )
+    return kept
+
+
+async def _persist_insight(
+    db: AsyncIOMotorDatabase,
+    *,
+    user_id: str,
+    chat_id: str,
+    chat: dict[str, Any],
+    insight_type: str,
+    data: dict[str, Any],
+    assistant_content: str,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    user_prompt = INSIGHT_USER_PROMPTS[insight_type]
+    messages = _messages_with_insight(
+        list(chat.get("messages", [])),
+        insight_type=insight_type,
+        user_prompt=user_prompt,
+        assistant_content=assistant_content,
+        timestamp=now,
+    )
+
+    if insight_type == "summary":
+        payload = {
+            "executiveSummary": data,
+            "summaryStatus": "completed",
+            "summaryGeneratedAt": now,
+        }
+    else:
+        payload = {
+            "riskAnalysis": data,
+            "riskStatus": "completed",
+            "riskGeneratedAt": now,
+        }
+
+    await db["chats"].update_one(
+        {"chatId": chat_id, "userId": ObjectId(user_id)},
+        {
+            "$set": {
+                **payload,
+                "messages": messages,
+                "updatedAt": now,
+            }
+        },
+    )
+    logger.info("Persisted %s insight for chat %s", insight_type, chat_id)
+    return messages
 
 
 async def _generate_json(
@@ -147,8 +249,67 @@ async def generate_risk_analysis(
         user_prompt=f"Context:\n{context}\n\nExtract explicitly stated risks as JSON.",
         settings=settings,
     )
-    parsed = _extract_json(raw)
+    parsed = _normalize_risk_payload(_extract_json(raw))
     return RiskAnalysisData.model_validate(parsed)
+
+
+def enrich_chat_messages(chat: dict[str, Any]) -> list[dict[str, Any]]:
+    """Ensure cached insights also appear in the session message history."""
+    messages = list(chat.get("messages", []))
+    updated = messages
+
+    if chat.get("executiveSummary") and not any(
+        m.get("insightType") == "summary" for m in updated
+    ):
+        ts = chat.get("summaryGeneratedAt") or chat.get("updatedAt") or datetime.now(
+            timezone.utc
+        )
+        if not isinstance(ts, datetime):
+            ts = datetime.now(timezone.utc)
+        updated = _messages_with_insight(
+            updated,
+            insight_type="summary",
+            user_prompt=INSIGHT_USER_PROMPTS["summary"],
+            assistant_content=format_summary_markdown(chat["executiveSummary"]),
+            timestamp=ts,
+        )
+
+    if chat.get("riskAnalysis") and not any(
+        m.get("insightType") == "risks" for m in updated
+    ):
+        ts = chat.get("riskGeneratedAt") or chat.get("updatedAt") or datetime.now(
+            timezone.utc
+        )
+        if not isinstance(ts, datetime):
+            ts = datetime.now(timezone.utc)
+        updated = _messages_with_insight(
+            updated,
+            insight_type="risks",
+            user_prompt=INSIGHT_USER_PROMPTS["risks"],
+            assistant_content=format_risks_markdown(chat["riskAnalysis"]),
+            timestamp=ts,
+        )
+
+    return updated
+
+
+async def sync_insight_messages(
+    db: AsyncIOMotorDatabase,
+    *,
+    user_id: str,
+    chat_id: str,
+    chat: dict[str, Any],
+) -> dict[str, Any]:
+    messages = enrich_chat_messages(chat)
+    if messages == chat.get("messages"):
+        return chat
+
+    now = datetime.now(timezone.utc)
+    await db["chats"].update_one(
+        {"chatId": chat_id, "userId": ObjectId(user_id)},
+        {"$set": {"messages": messages, "updatedAt": now}},
+    )
+    return {**chat, "messages": messages}
 
 
 def _serialize_dt(value: datetime | None) -> str | None:
@@ -222,16 +383,16 @@ async def generate_summary(
     try:
         summary = await generate_executive_summary(chat)
         data = summary.model_dump()
-        await db["chats"].update_one(
-            {"chatId": chat_id, "userId": ObjectId(user_id)},
-            {
-                "$set": {
-                    "executiveSummary": data,
-                    "summaryStatus": "completed",
-                    "summaryGeneratedAt": now,
-                    "updatedAt": now,
-                }
-            },
+        content = format_summary_markdown(data)
+        await _persist_insight(
+            db,
+            user_id=user_id,
+            chat_id=chat_id,
+            chat=chat,
+            insight_type="summary",
+            data=data,
+            assistant_content=content,
+            now=now,
         )
         return {
             "status": "ready",
@@ -326,16 +487,16 @@ async def generate_risks(
     try:
         risks = await generate_risk_analysis(chat)
         data = risks.model_dump()
-        await db["chats"].update_one(
-            {"chatId": chat_id, "userId": ObjectId(user_id)},
-            {
-                "$set": {
-                    "riskAnalysis": data,
-                    "riskStatus": "completed",
-                    "riskGeneratedAt": now,
-                    "updatedAt": now,
-                }
-            },
+        content = format_risks_markdown(data)
+        await _persist_insight(
+            db,
+            user_id=user_id,
+            chat_id=chat_id,
+            chat=chat,
+            insight_type="risks",
+            data=data,
+            assistant_content=content,
+            now=now,
         )
         return {
             "status": "ready",

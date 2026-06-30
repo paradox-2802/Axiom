@@ -100,6 +100,12 @@ async def test_executive_summary_generates_on_post_and_caches(
     assert body["cached"] is False
     mock_generate_summary.assert_called_once()
 
+    import core.database as database
+
+    stored = await database._db.chats.find_one({"chatId": chat_id})
+    assert stored["executiveSummary"] is not None
+    assert any(m.get("insightType") == "summary" for m in stored["messages"])
+
     get_response = await client.get(
         f"/insights/{chat_id}/summary",
         headers=auth_headers(token),
@@ -127,6 +133,12 @@ async def test_risk_analysis_generates_on_post(
     body = response.json()
     assert body["status"] == "ready"
     assert len(body["data"]["risks"]) == 1
+
+    import core.database as database
+
+    stored = await database._db.chats.find_one({"chatId": chat_id})
+    assert stored["riskAnalysis"] is not None
+    assert any(m.get("insightType") == "risks" for m in stored["messages"])
 
 
 async def test_insights_unavailable_before_ingestion(client: AsyncClient):
