@@ -1,0 +1,21 @@
+# Pinned direct dependencies (versions verified in Docker backend image).
+# Rebuild after changes: docker compose build backend worker
+
+fastapi==0.138.2
+uvicorn[standard]==0.49.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+email-validator==2.3.0
+motor==3.7.1
+python-jose[cryptography]==3.5.0
+bcrypt==5.0.0
+qdrant-client==1.16.2
+langchain-qdrant==1.1.0
+langchain-text-splitters==1.1.2
+arq==0.28.0
+redis==5.3.1
+pdfplumber==0.11.10
+python-dotenv==1.2.2
+httpx==0.28.1
+python-multipart==0.0.32
+slowapi==0.1.9
